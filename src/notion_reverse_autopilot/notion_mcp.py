@@ -83,12 +83,43 @@ class NotionMCPClient:
         for name in candidates:
             if name in self._tools:
                 return name
-        # Fuzzy fallback: check if any tool name contains any candidate keyword
-        for name in candidates:
-            keyword = name.replace("-", "").replace("_", "").lower()
-            for tool_name in self._tools:
-                if keyword in tool_name.replace("-", "").replace("_", "").lower():
+
+        # Fuzzy fallback:
+        # - Normalize both sides (case + separators)
+        # - Also allow token-based matching so we can handle different naming styles
+        #   like `API-post-page`, `notion_create_pages`, or `createPage`.
+        stopwords = {"a", "an", "the", "of", "for", "and", "or", "to", "in"}
+        tool_names = list(self._tools.keys())
+        tool_norm_map = {
+            tool_name: tool_name.replace("-", "").replace("_", "").replace(" ", "").lower()
+            for tool_name in tool_names
+        }
+
+        for candidate in candidates:
+            # Split on common separators and whitespace; keep simple alnum tokens.
+            tokens = []
+            for part in candidate.replace("-", " ").replace("_", " ").split():
+                cleaned = "".join(ch for ch in part if ch.isalnum()).lower()
+                if not cleaned or cleaned in stopwords:
+                    continue
+                tokens.append(cleaned)
+
+            if not tokens:
+                continue
+
+            # Try strict token containment first (all tokens must be present).
+            for tool_name, tool_norm in tool_norm_map.items():
+                if all(tok in tool_norm for tok in tokens):
                     return tool_name
+
+            # Then loosen matching: if it looks like a "create+page" intent, require both.
+            # This covers many tool naming variants without accidentally matching unrelated tools.
+            lowered = candidate.lower()
+            if "create" in lowered and "page" in lowered:
+                for tool_name, tool_norm in tool_norm_map.items():
+                    if "create" in tool_norm and "page" in tool_norm:
+                        return tool_name
+
         return None
 
     async def close(self):
@@ -191,9 +222,22 @@ class NotionMCPClient:
         if not parent_id:
             raise RuntimeError("No pages found in workspace. Please create at least one page in Notion first.")
 
-        tool = self._find_tool("create-a-page", "notion-create-pages", "notion_create_page")
+        tool = self._find_tool(
+            "create-a-page",
+            "create-page",
+            "notion-create-pages",
+            "notion_create_pages",
+            "notion-create-page",
+            "notion_create_page",
+            "API-post-page",
+            "api-post-page",
+        )
         if not tool:
-            raise RuntimeError("No page creation tool found in MCP server")
+            available = ", ".join(sorted(self._tools.keys()))
+            raise RuntimeError(
+                "No page creation tool found in MCP server. "
+                f"Available tools: [{available}]"
+            )
 
         page = await self._call(tool, {
             "parent": {"type": "page_id", "page_id": parent_id},
@@ -216,7 +260,16 @@ class NotionMCPClient:
         """Create a page under the Autopilot Hub."""
         root_id = await self.ensure_root_page()
 
-        tool = self._find_tool("create-a-page", "notion-create-pages", "notion_create_page")
+        tool = self._find_tool(
+            "create-a-page",
+            "create-page",
+            "notion-create-pages",
+            "notion_create_pages",
+            "notion-create-page",
+            "notion_create_page",
+            "API-post-page",
+            "api-post-page",
+        )
         if not tool:
             return {}
 
