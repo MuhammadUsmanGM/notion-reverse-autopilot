@@ -112,13 +112,20 @@ class NotionMCPClient:
                 if all(tok in tool_norm for tok in tokens):
                     return tool_name
 
-            # Then loosen matching: if it looks like a "create+page" intent, require both.
-            # This covers many tool naming variants without accidentally matching unrelated tools.
+            # Loosen matching: cover create+page AND post+page variants.
+            # The Notion MCP server names its tool "API-post-page" (from OpenAPI spec),
+            # so we need to match "post" as a synonym for "create" here.
             lowered = candidate.lower()
-            if "create" in lowered and "page" in lowered:
+            if "page" in lowered and ("create" in lowered or "post" in lowered or "new" in lowered):
                 for tool_name, tool_norm in tool_norm_map.items():
-                    if "create" in tool_norm and "page" in tool_norm:
+                    if "page" in tool_norm and ("create" in tool_norm or "post" in tool_norm or "new" in tool_norm):
                         return tool_name
+
+        # Last-resort: scan ALL tool names for any that look like page creation.
+        # This catches any future naming changes in the MCP server package.
+        for tool_name, tool_norm in tool_norm_map.items():
+            if "page" in tool_norm and ("post" in tool_norm or "create" in tool_norm or "new" in tool_norm):
+                return tool_name
 
         return None
 
