@@ -53,6 +53,9 @@ class AIAnalyzer:
         self.llm = LLMClient()
 
     def analyze(self, snapshot: WorkspaceSnapshot) -> AnalysisResult:
+        from rich.console import Console
+        console = Console()
+
         result = AnalysisResult()
 
         all_pages = snapshot.pages + snapshot.databases
@@ -62,11 +65,32 @@ class AIAnalyzer:
 
         page_summaries = self._build_page_summaries(all_pages)
 
-        result.categories = self._categorize_pages(page_summaries)
-        result.connections = self._find_connections(page_summaries)
+        console.print("[dim]AI: Categorizing pages...[/]")
+        try:
+            result.categories = self._categorize_pages(page_summaries)
+        except Exception as e:
+            console.print(f"[yellow]Categorization failed, continuing: {e}[/]")
+
+        console.print("[dim]AI: Finding connections...[/]")
+        try:
+            result.connections = self._find_connections(page_summaries)
+        except Exception as e:
+            console.print(f"[yellow]Connection finding failed, continuing: {e}[/]")
+
         result.topic_clusters = self._cluster_topics(result.categories)
-        result.insights = self._generate_insights(page_summaries, result)
-        result.workspace_summary = self._generate_summary(page_summaries, result)
+
+        console.print("[dim]AI: Generating insights...[/]")
+        try:
+            result.insights = self._generate_insights(page_summaries, result)
+        except Exception as e:
+            console.print(f"[yellow]Insight generation failed, continuing: {e}[/]")
+
+        console.print("[dim]AI: Writing summary...[/]")
+        try:
+            result.workspace_summary = self._generate_summary(page_summaries, result)
+        except Exception as e:
+            console.print(f"[yellow]Summary generation failed, continuing: {e}[/]")
+
         result.health_score = max(0, 100 - snapshot.chaos.total_chaos_score)
 
         return result

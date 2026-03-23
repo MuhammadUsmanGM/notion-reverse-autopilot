@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import httpx
 
 from notion_reverse_autopilot.config import config
@@ -28,24 +29,86 @@ class LLMClient:
         else:
             raise ValueError(f"Unknown AI_PROVIDER: {self.provider}")
 
-    def ask_json(self, prompt: str, max_tokens: int = 4096) -> dict:
-        """Send a prompt and parse the response as JSON."""
+    def ask_json(self, prompt: str, max_tokens: int = 8192) -> dict:
+        """Send a prompt and parse the response as JSON. Handles truncated/malformed responses."""
         raw = self.ask(prompt, max_tokens)
-        # Strip markdown code fences if present
         text = raw.strip()
+
+        # Strip markdown code fences
         if text.startswith("```"):
             lines = text.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
-            text = "\n".join(lines)
+            text = "\n".join(lines).strip()
+
+        # Attempt 1: direct parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to find JSON in the response
-            start = text.find("{")
+            pass
+
+        # Attempt 2: extract JSON object from response
+        start = text.find("{")
+        if start >= 0:
+            # Try to find the matching closing brace
             end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                return json.loads(text[start:end])
-            return {}
+            if end > start:
+                try:
+                    return json.loads(text[start:end])
+                except json.JSONDecodeError:
+                    pass
+
+            # Attempt 3: fix truncated JSON by closing open structures
+            fragment = text[start:]
+            repaired = self._repair_json(fragment)
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
+
+        return {}
+
+    def _repair_json(self, text: str) -> str:
+        """Attempt to repair truncated JSON by closing open brackets/braces."""
+        # Remove any trailing incomplete string (unterminated quote)
+        # Find the last complete key-value pair
+        last_good = len(text)
+        in_string = False
+        escape = False
+        for i, ch in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+
+        # If we ended inside a string, truncate to last comma or bracket before it
+        if in_string:
+            # Find the last quote that opened this string
+            last_quote = text.rfind('"')
+            if last_quote > 0:
+                # Go back to the last comma, bracket, or brace
+                truncate_at = max(
+                    text.rfind(',', 0, last_quote),
+                    text.rfind('[', 0, last_quote),
+                    text.rfind('{', 0, last_quote),
+                )
+                if truncate_at > 0:
+                    text = text[:truncate_at]
+
+        # Count open brackets and braces, close them
+        open_braces = text.count('{') - text.count('}')
+        open_brackets = text.count('[') - text.count(']')
+
+        # Remove trailing comma if present
+        text = text.rstrip().rstrip(',')
+
+        text += ']' * max(0, open_brackets)
+        text += '}' * max(0, open_braces)
+
+        return text
 
     # ── Providers ────────────────────────────────────────────────
 
@@ -70,9 +133,13 @@ class LLMClient:
             params={"key": config.GEMINI_API_KEY},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3},
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature": 0.3,
+                    "responseMimeType": "application/json",
+                },
             },
-            timeout=60.0,
+            timeout=120.0,
         )
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
