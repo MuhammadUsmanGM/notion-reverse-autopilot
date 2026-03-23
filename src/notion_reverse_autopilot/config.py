@@ -25,7 +25,6 @@ class Config:
 
     # Notion
     NOTION_API_TOKEN: str = os.getenv("NOTION_API_TOKEN", "")
-    NOTION_API_BASE: str = "https://api.notion.com/v1"
     NOTION_VERSION: str = "2022-06-28"
 
     # General
@@ -56,14 +55,6 @@ class Config:
             pass  # no key needed
 
         return errors
-
-    @property
-    def notion_headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.NOTION_API_TOKEN}",
-            "Notion-Version": self.NOTION_VERSION,
-            "Content-Type": "application/json",
-        }
 
 
 config = Config()
