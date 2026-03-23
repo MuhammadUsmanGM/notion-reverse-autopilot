@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import httpx
 
 from notion_reverse_autopilot.config import config
@@ -128,21 +129,33 @@ class LLMClient:
         return resp.json()["choices"][0]["message"]["content"]
 
     def _call_gemini(self, prompt: str, max_tokens: int) -> str:
-        resp = httpx.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
-            params={"key": config.GEMINI_API_KEY},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "maxOutputTokens": max_tokens,
-                    "temperature": 0.3,
-                    "responseMimeType": "application/json",
-                },
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.3,
+                "responseMimeType": "application/json",
             },
-            timeout=120.0,
-        )
-        resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        }
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = httpx.post(
+                    url,
+                    params={"key": config.GEMINI_API_KEY},
+                    json=payload,
+                    timeout=120.0,
+                )
+                resp.raise_for_status()
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    time.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
+                    continue
+                raise
+        raise last_exc  # type: ignore
 
     def _call_ollama(self, prompt: str, max_tokens: int) -> str:
         resp = httpx.post(

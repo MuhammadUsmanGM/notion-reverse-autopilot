@@ -20,7 +20,7 @@ class Config:
         "groq": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         "gemini": os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
         "ollama": os.getenv("OLLAMA_MODEL", "llama3"),
-        "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
     }
 
     # Notion
