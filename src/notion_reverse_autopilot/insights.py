@@ -104,9 +104,14 @@ class InsightReportGenerator:
                 },
                 children=children[:100],
             )
-            page_url = page.get("url", page.get("id", ""))
+            page_id = page.get("id")
+            # Append remaining blocks in batches of 100 if the briefing was large
+            if page_id and len(children) > 100:
+                for i in range(100, len(children), 100):
+                    await self.client.append_blocks(page_id, children[i:i + 100])
+            page_url = page.get("url", page_id or "")
             console.print(f"[bold green]Brain Briefing created:[/] {page_url}")
-            return page.get("id")
+            return page_id
         except Exception as e:
             console.print(f"[bold red]Failed to create briefing: {e}[/]")
             return None

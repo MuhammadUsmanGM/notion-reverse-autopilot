@@ -52,6 +52,18 @@ class AIAnalyzer:
     def __init__(self):
         self.llm = LLMClient()
 
+    # Must match WorkspaceScanner._SYSTEM_PAGE_MARKERS
+    _SYSTEM_PAGE_MARKERS = (
+        "autopilot hub",
+        "autopilot dashboard",
+        "topic clusters — autopilot",
+        "topic clusters - autopilot",
+        "brain briefing",
+    )
+
+    def _is_system_page(self, page: PageSnapshot) -> bool:
+        return any(m in page.title.strip().lower() for m in self._SYSTEM_PAGE_MARKERS)
+
     def analyze(self, snapshot: WorkspaceSnapshot) -> AnalysisResult:
         from rich.console import Console
         console = Console()
@@ -59,11 +71,13 @@ class AIAnalyzer:
         result = AnalysisResult()
 
         all_pages = snapshot.pages + snapshot.databases
-        if not all_pages:
+        # Exclude autopilot-generated pages so they don't pollute AI analysis
+        user_pages = [p for p in all_pages if not self._is_system_page(p)]
+        if not user_pages:
             result.workspace_summary = "Empty workspace — nothing to analyze."
             return result
 
-        page_summaries = self._build_page_summaries(all_pages)
+        page_summaries = self._build_page_summaries(user_pages)
 
         console.print("[dim]AI: Categorizing pages...[/]")
         try:
