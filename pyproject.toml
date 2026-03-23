@@ -1,0 +1,27 @@
+[project]
+name = "notion-reverse-autopilot"
+version = "0.1.0"
+description = "AI agent that watches your messy Notion workspace, auto-organizes everything, and surfaces hidden insights about how you think."
+readme = "README.md"
+authors = [
+    { name = "MuhammadUsmanGM", email = "MuhammadUsmanGM@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.3.1",
+    "httpx>=0.28.1",
+    "mcp>=1.26.0",
+    "python-dotenv>=1.2.2",
+    "rich>=14.3.3",
+    "schedule>=1.2.2",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.39.0"]
+
+[project.scripts]
+notion-autopilot = "notion_reverse_autopilot.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

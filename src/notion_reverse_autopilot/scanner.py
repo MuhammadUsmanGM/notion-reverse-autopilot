@@ -1,0 +1,165 @@
+"""Workspace Scanner — crawls entire Notion workspace and builds a snapshot."""
+
+from __future__ import annotations
+
+import datetime
+from dataclasses import dataclass, field
+from typing import Any
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+from notion_reverse_autopilot.notion_mcp import NotionMCPClient
+
+console = Console()
+
+
+@dataclass
+class PageSnapshot:
+    id: str
+    title: str
+    content_text: str
+    parent_type: str
+    parent_id: str | None
+    properties: dict[str, Any]
+    created_time: str
+    last_edited_time: str
+    url: str
+    object_type: str  # "page" or "database"
+    has_content: bool = True
+    word_count: int = 0
+    has_tags: bool = False
+    is_orphan: bool = False
+    linked_page_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChaosSignals:
+    untagged_pages: int = 0
+    orphan_pages: int = 0
+    empty_pages: int = 0
+    duplicate_titles: list[str] = field(default_factory=list)
+    very_long_pages: int = 0
+    very_short_pages: int = 0
+    pages_without_structure: int = 0
+    total_chaos_score: float = 0.0
+
+
+@dataclass
+class WorkspaceSnapshot:
+    pages: list[PageSnapshot] = field(default_factory=list)
+    databases: list[PageSnapshot] = field(default_factory=list)
+    chaos: ChaosSignals = field(default_factory=ChaosSignals)
+    total_items: int = 0
+    scan_timestamp: str = ""
+
+
+class WorkspaceScanner:
+    def __init__(self, client: NotionMCPClient):
+        self.client = client
+
+    async def scan(self) -> WorkspaceSnapshot:
+        snapshot = WorkspaceSnapshot()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Searching workspace...", total=None)
+
+            raw_results = await self.client.search_all_pages()
+            progress.update(task, description=f"Found {len(raw_results)} items. Scanning content...")
+
+            for i, item in enumerate(raw_results):
+                obj_type = item.get("object", "page")
+                item_id = item["id"]
+                title = self.client.extract_title(item)
+
+                progress.update(task, description=f"Scanning [{i+1}/{len(raw_results)}] {title[:40]}...")
+
+                content_text = ""
+                if obj_type == "page":
+                    try:
+                        blocks = await self.client.get_page_content(item_id)
+                        content_text = self.client.blocks_to_text(blocks)
+                    except Exception:
+                        content_text = ""
+
+                parent = item.get("parent", {})
+                parent_type = parent.get("type", "workspace")
+                parent_id = parent.get(parent_type)
+
+                props = item.get("properties", {})
+                has_tags = any(
+                    p.get("type") in ("multi_select", "select") and p.get(p["type"])
+                    for p in props.values()
+                )
+
+                page = PageSnapshot(
+                    id=item_id,
+                    title=title,
+                    content_text=content_text,
+                    parent_type=parent_type,
+                    parent_id=parent_id if isinstance(parent_id, str) else None,
+                    properties=props,
+                    created_time=item.get("created_time", ""),
+                    last_edited_time=item.get("last_edited_time", ""),
+                    url=item.get("url", ""),
+                    object_type=obj_type,
+                    has_content=bool(content_text.strip()),
+                    word_count=len(content_text.split()) if content_text else 0,
+                    has_tags=has_tags,
+                    is_orphan=parent_type == "workspace",
+                )
+
+                if obj_type == "database":
+                    snapshot.databases.append(page)
+                else:
+                    snapshot.pages.append(page)
+
+        snapshot.total_items = len(snapshot.pages) + len(snapshot.databases)
+        snapshot.chaos = self._analyze_chaos(snapshot)
+        snapshot.scan_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        return snapshot
+
+    def _analyze_chaos(self, snapshot: WorkspaceSnapshot) -> ChaosSignals:
+        chaos = ChaosSignals()
+        all_pages = snapshot.pages + snapshot.databases
+        titles = [p.title.strip().lower() for p in all_pages if p.title.strip()]
+
+        for page in snapshot.pages:
+            if not page.has_tags:
+                chaos.untagged_pages += 1
+            if page.is_orphan:
+                chaos.orphan_pages += 1
+            if not page.has_content:
+                chaos.empty_pages += 1
+            if page.word_count > 2000:
+                chaos.very_long_pages += 1
+            if 0 < page.word_count < 10:
+                chaos.very_short_pages += 1
+            if page.has_content and "\n" not in page.content_text:
+                chaos.pages_without_structure += 1
+
+        seen = set()
+        for t in titles:
+            if t in seen:
+                chaos.duplicate_titles.append(t)
+            seen.add(t)
+        chaos.duplicate_titles = list(set(chaos.duplicate_titles))
+
+        total = len(snapshot.pages) or 1
+        chaos.total_chaos_score = round(
+            (
+                (chaos.untagged_pages / total) * 25
+                + (chaos.orphan_pages / total) * 25
+                + (chaos.empty_pages / total) * 15
+                + (len(chaos.duplicate_titles) / total) * 15
+                + (chaos.pages_without_structure / total) * 20
+            ),
+            1,
+        )
+
+        return chaos
