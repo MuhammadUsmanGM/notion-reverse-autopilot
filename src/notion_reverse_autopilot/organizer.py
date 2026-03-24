@@ -91,8 +91,8 @@ class AutoOrganizer:
                 )
                 actions.append(action)
                 self.changelog.log("annotate", cat.title, f"Category: {cat.category}")
-            except Exception:
-                pass
+            except Exception as e:
+                console.print(f"[yellow]Failed to annotate '{cat.title}': {e}[/]")
         return actions
 
     async def _create_topic_clusters(self, analysis: AnalysisResult) -> list[OrganizeAction]:
@@ -157,8 +157,8 @@ class AutoOrganizer:
                     "link", conn.page_a_title,
                     f"Linked to {conn.page_b_title}: {conn.relationship}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                console.print(f"[yellow]Failed to link '{conn.page_a_title}': {e}[/]")
         return actions
 
     async def _update_dashboard(self, snapshot: WorkspaceSnapshot, analysis: AnalysisResult) -> list[OrganizeAction]:

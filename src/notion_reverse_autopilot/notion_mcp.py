@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
@@ -16,6 +15,47 @@ from notion_reverse_autopilot.config import config
 
 console = Console()
 
+# Map of logical operation -> list of known tool names across server versions
+# The first match found in discovered tools wins.
+TOOL_MAP = {
+    "search": [
+        "API-post-search", "search", "search-content",
+        "notion-search", "notion_search", "post-search",
+    ],
+    "get_page": [
+        "API-retrieve-a-page", "retrieve-a-page",
+        "notion-fetch", "notion_retrieve_page",
+    ],
+    "get_blocks": [
+        "API-get-block-children", "get-block-children",
+        "retrieve-block-children", "get-page-content",
+        "notion_retrieve_block_children",
+    ],
+    "get_database": [
+        "API-retrieve-a-database", "retrieve-a-database",
+        "notion_retrieve_database",
+    ],
+    "create_page": [
+        "API-post-page", "create-a-page", "post-page",
+        "notion-create-pages", "notion_create_page",
+    ],
+    "update_page": [
+        "API-patch-page", "update-a-page", "patch-page",
+        "update-page-properties", "notion-update-page",
+        "notion_update_page_properties",
+    ],
+    "append_blocks": [
+        "API-patch-block-children", "patch-block-children",
+        "append-block-children", "append-a-block",
+        "notion_append_block_children",
+    ],
+    "create_database": [
+        "API-create-a-data-source", "create-a-database",
+        "create-a-data-source", "notion-create-database",
+        "notion_create_database",
+    ],
+}
+
 
 class NotionMCPClient:
     """Communicates with Notion through the official @notionhq/notion-mcp-server via MCP protocol."""
@@ -24,8 +64,9 @@ class NotionMCPClient:
         self._session: ClientSession | None = None
         self._cm_stdio = None
         self._cm_session = None
-        self._tools: dict[str, dict] = {}  # name -> {description, inputSchema}
-        self._root_page_id: str | None = None  # parent page for created content
+        self._available_tools: set[str] = set()
+        self._resolved: dict[str, str | None] = {}  # operation -> actual tool name
+        self._root_page_id: str | None = None
 
     async def connect(self):
         """Spawn the Notion MCP server and establish a session."""
@@ -36,14 +77,12 @@ class NotionMCPClient:
             }),
             "PATH": os.environ.get("PATH", ""),
         }
-        # Windows needs extra env vars for npx/node to work
         if sys.platform == "win32":
             for key in ("APPDATA", "USERPROFILE", "SYSTEMROOT", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP"):
                 val = os.environ.get(key, "")
                 if val:
                     env[key] = val
 
-        # On Windows, npx is a .cmd script — must invoke via cmd.exe
         if sys.platform == "win32":
             command = "cmd"
             args = ["/c", "npx", "-y", "@notionhq/notion-mcp-server"]
@@ -51,11 +90,7 @@ class NotionMCPClient:
             command = "npx"
             args = ["-y", "@notionhq/notion-mcp-server"]
 
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env,
-        )
+        server_params = StdioServerParameters(command=command, args=args, env=env)
 
         self._cm_stdio = stdio_client(server_params)
         read, write = await self._cm_stdio.__aenter__()
@@ -64,73 +99,32 @@ class NotionMCPClient:
         self._session = await self._cm_session.__aenter__()
 
         await self._session.initialize()
-
-        # Auto-discover available tools so we use the correct names
         await self._discover_tools()
 
     async def _discover_tools(self):
-        """Discover all available MCP tool names and cache them."""
+        """Discover all available MCP tools and resolve the operation map."""
         resp = await self._session.list_tools()
-        for tool in resp.tools:
-            self._tools[tool.name] = {
-                "description": tool.description,
-                "inputSchema": tool.inputSchema,
-            }
-        console.print(f"[dim]Discovered {len(self._tools)} MCP tools: {', '.join(sorted(self._tools.keys()))}[/]")
+        self._available_tools = {t.name for t in resp.tools}
+        console.print(f"[dim]Discovered {len(self._available_tools)} MCP tools: {', '.join(sorted(self._available_tools))}[/]")
 
-    def _find_tool(self, *candidates: str) -> str | None:
-        """Find the first matching tool name from a list of candidates."""
-        for name in candidates:
-            if name in self._tools:
-                return name
+        # Resolve each logical operation to the first matching real tool
+        for operation, candidates in TOOL_MAP.items():
+            self._resolved[operation] = None
+            for candidate in candidates:
+                if candidate in self._available_tools:
+                    self._resolved[operation] = candidate
+                    break
 
-        # Fuzzy fallback:
-        # - Normalize both sides (case + separators)
-        # - Also allow token-based matching so we can handle different naming styles
-        #   like `API-post-page`, `notion_create_pages`, or `createPage`.
-        stopwords = {"a", "an", "the", "of", "for", "and", "or", "to", "in"}
-        tool_names = list(self._tools.keys())
-        tool_norm_map = {
-            tool_name: tool_name.replace("-", "").replace("_", "").replace(" ", "").lower()
-            for tool_name in tool_names
-        }
+        # Log resolved mappings for debugging
+        for op, tool in self._resolved.items():
+            status = f"[green]{tool}[/]" if tool else "[red]NOT FOUND[/]"
+            console.print(f"[dim]  {op} -> {status}[/]")
 
-        for candidate in candidates:
-            # Split on common separators and whitespace; keep simple alnum tokens.
-            tokens = []
-            for part in candidate.replace("-", " ").replace("_", " ").split():
-                cleaned = "".join(ch for ch in part if ch.isalnum()).lower()
-                if not cleaned or cleaned in stopwords:
-                    continue
-                tokens.append(cleaned)
-
-            if not tokens:
-                continue
-
-            # Try strict token containment first (all tokens must be present).
-            for tool_name, tool_norm in tool_norm_map.items():
-                if all(tok in tool_norm for tok in tokens):
-                    return tool_name
-
-            # Loosen matching: cover create+page AND post+page variants.
-            # The Notion MCP server names its tool "API-post-page" (from OpenAPI spec),
-            # so we need to match "post" as a synonym for "create" here.
-            lowered = candidate.lower()
-            if "page" in lowered and ("create" in lowered or "post" in lowered or "new" in lowered):
-                for tool_name, tool_norm in tool_norm_map.items():
-                    if "page" in tool_norm and ("create" in tool_norm or "post" in tool_norm or "new" in tool_norm):
-                        return tool_name
-
-        # Last-resort: scan ALL tool names for any that look like page creation.
-        # This catches any future naming changes in the MCP server package.
-        for tool_name, tool_norm in tool_norm_map.items():
-            if "page" in tool_norm and ("post" in tool_norm or "create" in tool_norm or "new" in tool_norm):
-                return tool_name
-
-        return None
+    def _tool(self, operation: str) -> str | None:
+        """Get the resolved tool name for a logical operation."""
+        return self._resolved.get(operation)
 
     async def close(self):
-        """Shut down the MCP session and server process."""
         if self._cm_session:
             await self._cm_session.__aexit__(None, None, None)
         if self._cm_stdio:
@@ -152,10 +146,9 @@ class NotionMCPClient:
     # ── READ operations ──────────────────────────────────────────
 
     async def search_all_pages(self, query: str = "") -> list[dict]:
-        """Search across the entire workspace."""
-        tool = self._find_tool("search", "search-content", "notion-search", "notion_search")
+        tool = self._tool("search")
         if not tool:
-            console.print("[red]No search tool found in MCP server[/]")
+            console.print("[red]No search tool found[/]")
             return []
 
         args = {}
@@ -170,22 +163,17 @@ class NotionMCPClient:
         return []
 
     async def get_page(self, page_id: str) -> dict:
-        tool = self._find_tool("retrieve-a-page", "notion-fetch", "notion_retrieve_page")
+        tool = self._tool("get_page")
         if not tool:
             return {}
         data = await self._call(tool, {"page_id": page_id})
         return data if isinstance(data, dict) else {}
 
     async def get_page_content(self, page_id: str) -> list[dict]:
-        """Get block children of a page."""
-        tool = self._find_tool(
-            "get-page-content", "retrieve-block-children",
-            "get-block-children", "notion_retrieve_block_children",
-        )
+        tool = self._tool("get_blocks")
         if not tool:
             return []
 
-        # Try both parameter name conventions
         data = await self._call(tool, {"block_id": page_id})
         if data is None:
             data = await self._call(tool, {"page_id": page_id})
@@ -197,7 +185,7 @@ class NotionMCPClient:
         return []
 
     async def get_database(self, database_id: str) -> dict:
-        tool = self._find_tool("retrieve-a-database", "notion_retrieve_database")
+        tool = self._tool("get_database")
         if not tool:
             return {}
         data = await self._call(tool, {"database_id": database_id})
@@ -206,57 +194,65 @@ class NotionMCPClient:
     # ── WRITE operations ─────────────────────────────────────────
 
     async def ensure_root_page(self) -> str:
-        """Find or create a root 'Autopilot Hub' page to nest all created content under."""
         if self._root_page_id:
             return self._root_page_id
 
-        # Search for existing hub page
         results = await self.search_all_pages(query="Autopilot Hub")
         for r in results:
             if self.extract_title(r).strip() == "Autopilot Hub":
                 self._root_page_id = r["id"]
                 return self._root_page_id
 
-        # Create root page — we need an existing page as parent
-        # First, find ANY page in the workspace to use as parent
-        all_pages = await self.search_all_pages()
-        parent_id = None
-        for p in all_pages:
-            if p.get("object") == "page":
-                parent_id = p["id"]
-                break
-
-        if not parent_id:
-            raise RuntimeError("No pages found in workspace. Please create at least one page in Notion first.")
-
-        tool = self._find_tool(
-            "create-a-page",
-            "create-page",
-            "notion-create-pages",
-            "notion_create_pages",
-            "notion-create-page",
-            "notion_create_page",
-            "API-post-page",
-            "api-post-page",
-        )
+        tool = self._tool("create_page")
         if not tool:
-            available = ", ".join(sorted(self._tools.keys()))
-            raise RuntimeError(
-                "No page creation tool found in MCP server. "
-                f"Available tools: [{available}]"
-            )
+            raise RuntimeError(f"No page creation tool found. Available: {sorted(self._available_tools)}")
 
-        page = await self._call(tool, {
-            "parent": {"type": "page_id", "page_id": parent_id},
-            "properties": {
-                "title": {"title": [{"text": {"content": "Autopilot Hub"}}]}
-            },
-            "children": [
-                _heading_block("Notion Reverse Autopilot"),
-                _paragraph_block("All auto-generated content lives under this page."),
-                _divider_block(),
-            ],
-        })
+        # Try workspace-level parent first (appears at top of sidebar)
+        page = None
+        for parent_format in [
+            {"type": "workspace", "workspace": True},
+            {"workspace": True},
+        ]:
+            try:
+                result = await self._call(tool, {
+                    "parent": parent_format,
+                    "properties": {
+                        "title": {"title": [{"text": {"content": "Autopilot Hub"}}]}
+                    },
+                    "children": [
+                        _heading_block("Notion Reverse Autopilot"),
+                        _paragraph_block("All auto-generated content lives under this page."),
+                        _divider_block(),
+                    ],
+                })
+                if isinstance(result, dict) and result.get("id"):
+                    page = result
+                    break
+            except Exception:
+                continue
+
+        # Fallback: nest under a top-level page if workspace parent not supported
+        if not isinstance(page, dict) or not page.get("id"):
+            all_pages = await self.search_all_pages()
+            parent_id = None
+            for p in all_pages:
+                if p.get("object") == "page":
+                    parent_id = p["id"]
+                    break
+            if not parent_id:
+                raise RuntimeError("No pages found. Create at least one page in Notion first.")
+
+            page = await self._call(tool, {
+                "parent": {"type": "page_id", "page_id": parent_id},
+                "properties": {
+                    "title": {"title": [{"text": {"content": "Autopilot Hub"}}]}
+                },
+                "children": [
+                    _heading_block("Notion Reverse Autopilot"),
+                    _paragraph_block("All auto-generated content lives under this page."),
+                    _divider_block(),
+                ],
+            })
 
         if isinstance(page, dict) and page.get("id"):
             self._root_page_id = page["id"]
@@ -264,19 +260,8 @@ class NotionMCPClient:
         raise RuntimeError("Failed to create Autopilot Hub page")
 
     async def create_page(self, properties: dict, children: list[dict] | None = None) -> dict:
-        """Create a page under the Autopilot Hub."""
         root_id = await self.ensure_root_page()
-
-        tool = self._find_tool(
-            "create-a-page",
-            "create-page",
-            "notion-create-pages",
-            "notion_create_pages",
-            "notion-create-page",
-            "notion_create_page",
-            "API-post-page",
-            "api-post-page",
-        )
+        tool = self._tool("create_page")
         if not tool:
             return {}
 
@@ -291,30 +276,22 @@ class NotionMCPClient:
         return data if isinstance(data, dict) else {}
 
     async def update_page(self, page_id: str, properties: dict) -> dict:
-        tool = self._find_tool(
-            "update-page-properties", "update-a-page",
-            "notion-update-page", "notion_update_page_properties",
-        )
+        tool = self._tool("update_page")
         if not tool:
             return {}
         data = await self._call(tool, {"page_id": page_id, "properties": properties})
         return data if isinstance(data, dict) else {}
 
     async def append_blocks(self, block_id: str, children: list[dict]) -> dict:
-        tool = self._find_tool(
-            "append-block-children", "append-a-block",
-            "notion_append_block_children",
-        )
+        tool = self._tool("append_blocks")
         if not tool:
+            console.print("[red]No append_blocks tool found — cannot write to pages[/]")
             return {}
         data = await self._call(tool, {"block_id": block_id, "children": children})
         return data if isinstance(data, dict) else {}
 
     async def create_database(self, parent: dict, title: list[dict], properties: dict) -> dict:
-        tool = self._find_tool(
-            "create-a-database", "create-a-data-source",
-            "notion-create-database", "notion_create_database",
-        )
+        tool = self._tool("create_database")
         if not tool:
             return {}
         data = await self._call(tool, {
@@ -338,7 +315,6 @@ class NotionMCPClient:
         return "Untitled"
 
     def blocks_to_text(self, blocks: list[dict]) -> str:
-        """Convert block tree to plain text for AI analysis."""
         lines = []
         for block in blocks:
             btype = block.get("type", "")
@@ -351,7 +327,7 @@ class NotionMCPClient:
         return "\n".join(lines)
 
 
-# ── Block builders (used by ensure_root_page) ────────────────────
+# ── Block builders ───────────────────────────────────────────────
 
 def _heading_block(text: str, level: int = 1) -> dict:
     key = f"heading_{level}"
