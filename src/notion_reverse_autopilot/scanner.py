@@ -13,6 +13,9 @@ from notion_reverse_autopilot.notion_mcp import NotionMCPClient
 
 console = Console()
 
+# Marker that the organizer prepends to annotation callouts
+AUTOPILOT_MARKER = "[Autopilot]"
+
 
 @dataclass
 class PageSnapshot:
@@ -30,6 +33,7 @@ class PageSnapshot:
     word_count: int = 0
     has_tags: bool = False
     is_orphan: bool = False
+    is_annotated: bool = False  # True if autopilot callout found
     linked_page_ids: list[str] = field(default_factory=list)
 
 
@@ -42,6 +46,7 @@ class ChaosSignals:
     very_long_pages: int = 0
     very_short_pages: int = 0
     pages_without_structure: int = 0
+    annotated_pages: int = 0  # pages already organized by autopilot
     total_chaos_score: float = 0.0
 
 
@@ -96,6 +101,9 @@ class WorkspaceScanner:
                     for p in props.values()
                 )
 
+                # Detect if page was already annotated by autopilot
+                is_annotated = AUTOPILOT_MARKER in content_text
+
                 page = PageSnapshot(
                     id=item_id,
                     title=title,
@@ -111,6 +119,7 @@ class WorkspaceScanner:
                     word_count=len(content_text.split()) if content_text else 0,
                     has_tags=has_tags,
                     is_orphan=parent_type == "workspace",
+                    is_annotated=is_annotated,
                 )
 
                 if obj_type == "database":
@@ -140,15 +149,17 @@ class WorkspaceScanner:
 
     def _analyze_chaos(self, snapshot: WorkspaceSnapshot) -> ChaosSignals:
         chaos = ChaosSignals()
-        all_pages = snapshot.pages + snapshot.databases
 
-        # Exclude autopilot-generated system pages from scoring so they
-        # don't inflate orphan/untagged counts after an organize run.
+        # Exclude autopilot-generated system pages from scoring
         user_pages = [p for p in snapshot.pages if not self._is_system_page(p)]
-        titles = [p.title.strip().lower() for p in all_pages
-                  if p.title.strip() and not self._is_system_page(p)]
+        titles = [p.title.strip().lower() for p in user_pages if p.title.strip()]
 
         for page in user_pages:
+            # If page has been annotated by autopilot, it counts as organized
+            if page.is_annotated:
+                chaos.annotated_pages += 1
+                continue  # skip chaos counting for organized pages
+
             if not page.has_tags:
                 chaos.untagged_pages += 1
             if page.is_orphan:
@@ -170,15 +181,18 @@ class WorkspaceScanner:
         chaos.duplicate_titles = list(set(chaos.duplicate_titles))
 
         total = len(user_pages) or 1
-        chaos.total_chaos_score = round(
-            (
-                (chaos.untagged_pages / total) * 25
-                + (chaos.orphan_pages / total) * 25
-                + (chaos.empty_pages / total) * 15
-                + (len(chaos.duplicate_titles) / total) * 15
-                + (chaos.pages_without_structure / total) * 20
-            ),
-            1,
+        organized_ratio = chaos.annotated_pages / total
+
+        # Base chaos from remaining unorganized pages
+        raw_chaos = (
+            (chaos.untagged_pages / total) * 25
+            + (chaos.orphan_pages / total) * 25
+            + (chaos.empty_pages / total) * 15
+            + (len(chaos.duplicate_titles) / total) * 15
+            + (chaos.pages_without_structure / total) * 20
         )
+
+        # Reduce chaos score based on how many pages autopilot has organized
+        chaos.total_chaos_score = round(raw_chaos * (1 - organized_ratio), 1)
 
         return chaos

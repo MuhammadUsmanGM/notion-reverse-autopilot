@@ -63,6 +63,7 @@ async def _scan_async():
         table.add_row("Databases", str(len(snapshot.databases)))
         table.add_row("───", "───")
         table.add_row("Chaos Score", f"{snapshot.chaos.total_chaos_score:.1f}/100")
+        table.add_row("Organized by Autopilot", str(snapshot.chaos.annotated_pages))
         table.add_row("Untagged Pages", str(snapshot.chaos.untagged_pages))
         table.add_row("Orphan Pages", str(snapshot.chaos.orphan_pages))
         table.add_row("Empty Pages", str(snapshot.chaos.empty_pages))
